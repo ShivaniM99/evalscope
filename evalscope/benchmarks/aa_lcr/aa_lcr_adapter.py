@@ -4,7 +4,6 @@ import re
 import urllib.request
 import zipfile
 from pathlib import Path
-from typing import Any, Dict
 
 from evalscope.api.benchmark import BenchmarkMeta, DefaultDataAdapter
 from evalscope.api.dataset import Sample
@@ -14,6 +13,13 @@ from evalscope.api.metric import Score
 from evalscope.api.registry import register_benchmark
 from evalscope.constants import DEFAULT_EVALSCOPE_CACHE_DIR, Tags
 from evalscope.utils.logger import get_logger
+
+
+# Additional imports
+from typing import Any, Dict, List, Optional
+import numpy as np
+import pandas as pd
+from evalscope.benchmarks.aa_lcr.pruner import StratifiedDiscriminabilityPruner
 
 logger = get_logger()
 
@@ -84,18 +90,33 @@ AA-LCR (Artificial Analysis Long Context Retrieval) is a benchmark for evaluatin
 - Documents auto-downloaded if `text_dir` not specified
 - Judge prompt compares candidate answer against reference
 """,  # noqa: E501
-        dataset_id='evalscope/AA-LCR',
-        metric_list=['acc'],
-        few_shot_num=0,
-        train_split=None,
-        eval_split='test',
-        prompt_template=PROMPT_TEMPLATE,
-        extra_params={
+        dataset_id='evalscope/AA-LCR',        
+        metric_list=['acc'],                   
+        few_shot_num=0,                        
+        train_split=None,                      
+        eval_split='test',                     
+        prompt_template=PROMPT_TEMPLATE,       
+        extra_params={           #  ONE block only, with all 4 keys
             'text_dir': {
                 'type': 'str | null',
                 'description': 'Local directory containing extracted AA-LCR text files; if null will auto-download & extract.',
                 'value': None
-            }
+            },
+            'pruning_strategy': {
+                'type': 'str | null',
+                'description': "Set to 'stratified_discriminability' to enable pruning.",
+                'value': None
+            },
+            'scores_path': {
+                'type': 'str | null',
+                'description': 'Path to aa_lcr_flat JSONL with acc, reasoning_len, input_tokens columns.',
+                'value': None
+            },
+            'random_state': {
+                'type': 'int',
+                'description': 'Random seed for pruner reproducibility.',
+                'value': 42
+            },
         }
     )
 )
@@ -109,6 +130,27 @@ class AALCRAdapter(DefaultDataAdapter):
         # Get extra parameters
         self.text_dir = self.extra_params.get('text_dir')
 
+        # ── Pruning (new) ──────────────────────────────
+        self._pruned_indices: Optional[List[int]] = None
+        pruning_strategy = self.extra_params.get('pruning_strategy')
+        if pruning_strategy == 'stratified_discriminability':
+            scores_path = self.extra_params.get('scores_path')
+            if not scores_path:
+                raise ValueError(
+                    "pruning_strategy='stratified_discriminability' requires "
+                    "'scores_path' in extra_params pointing to aa_lcr_flat JSONL."
+                )
+            scores_df = pd.read_json(scores_path, lines=True)
+            pruner = StratifiedDiscriminabilityPruner(
+                random_state=int(self.extra_params.get('random_state', 42))
+            )
+            self._pruned_indices = pruner.fit_transform(scores_df)
+            logger.info(
+                f'[AA-LCR Pruner] Selected {len(self._pruned_indices)}/100 '
+                f"questions via '{pruning_strategy}'"
+            )
+        # ── End pruning ────────────────────────────────
+
     def load(self):
         # Auto download and extract when text_dir is not provided
         if not self.text_dir:
@@ -120,6 +162,17 @@ class AALCRAdapter(DefaultDataAdapter):
             )
 
         self.text_dir = Path(self.text_dir)
+
+        # ── Pruning filter (new) ───────────────────────
+        if self._pruned_indices is not None:
+            original_load = super().load()
+            filtered = [r for r in original_load if r.get('index') in self._pruned_indices]
+            logger.info(
+                f'[AA-LCR Pruner] Filtered {len(original_load)} → {len(filtered)} questions'
+            )
+            return filtered
+        # ── End pruning filter ─────────────────────────
+
         return super().load()
 
     def _ensure_text_dir_downloaded(self) -> Path:
