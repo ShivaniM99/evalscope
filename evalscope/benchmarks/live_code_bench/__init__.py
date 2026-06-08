@@ -1,0 +1,1 @@
+from evalscope.benchmarks.live_code_bench.live_code_bench_adapter import LiveCodeBenchAdapter

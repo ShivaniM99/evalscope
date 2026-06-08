@@ -1,4 +1,14 @@
 # flake8: noqa: E501
+"""
+live_code_bench_adapter.py
+==========================
+Standard evalscope adapter for LiveCodeBench (full dataset, no pruning).
+
+The only change from the original is that `record_to_sample` now stores
+`index` in the sample metadata. This is required so that
+LiveCodeBenchPrunedAdapter.sample_filter() can compare against the
+selected index set without needing any extra data structures.
+"""
 from typing import Any, Dict
 
 from evalscope.api.benchmark import BenchmarkMeta, DefaultDataAdapter
@@ -22,7 +32,9 @@ logger = get_logger()
         description="""
 ## Overview
 
-LiveCodeBench is a contamination-free benchmark for evaluating code generation models on real-world competitive programming problems. It continuously collects new problems from coding platforms to ensure models haven't seen the test data during training.
+LiveCodeBench is a contamination-free benchmark for evaluating code generation models
+on real-world competitive programming problems. It continuously collects new problems
+from coding platforms to ensure models haven't seen the test data during training.
 
 ## Task Description
 
@@ -42,119 +54,112 @@ LiveCodeBench is a contamination-free benchmark for evaluating code generation m
 ## Evaluation Notes
 
 - Default configuration uses **0-shot** evaluation
-- **Security Warning**: By default, code is executed in the local environment. We recommend using sandbox execution. See the [sandbox documentation](https://evalscope.readthedocs.io/en/latest/user_guides/sandbox.html) for details.
+- **Security Warning**: By default, code is executed in the local environment.
+  We recommend using sandbox execution.
 - Use `start_date` and `end_date` parameters to filter problems by date
 - Default timeout is 6 seconds per test case
 - Supports `pass@k` metric calculation
 """,
         dataset_id='evalscope/livecodebench_code_generation_lite_parquet',
         subset_list=[
-            'release_latest',
-            'release_v1',
-            'release_v2',
-            'release_v3',
-            'release_v4',
-            'release_v5',
-            'release_v6',
-            'v1',
-            'v1_v2',
-            'v1_v3',
-            'v1_v4',
-            'v1_v5',
-            'v1_v6',
-            'v2',
-            'v2_v3',
-            'v2_v4',
-            'v2_v5',
-            'v2_v6',
-            'v3',
-            'v3_v4',
-            'v3_v5',
-            'v3_v6',
-            'v4',
-            'v4_v5',
-            'v4_v6',
-            'v5',
-            'v5_v6',
+            'release_latest', 'release_v1', 'release_v2', 'release_v3',
+            'release_v4', 'release_v5', 'release_v6',
+            'v1', 'v1_v2', 'v1_v3', 'v1_v4', 'v1_v5', 'v1_v6',
+            'v2', 'v2_v3', 'v2_v4', 'v2_v5', 'v2_v6',
+            'v3', 'v3_v4', 'v3_v5', 'v3_v6',
+            'v4', 'v4_v5', 'v4_v6',
+            'v5', 'v5_v6',
             'v6',
         ],
         metric_list=['acc'],
         aggregation='mean_and_pass_at_k',
         eval_split='test',
-        prompt_template=
-        '### Question:\n{question_content}\n\n{format_prompt} ### Answer: (use the provided format with backticks)\n\n',
+        prompt_template=(
+            '### Question:\n{question_content}\n\n'
+            '{format_prompt} ### Answer: (use the provided format with backticks)\n\n'
+        ),
         review_timeout=6,
         extra_params={
             'start_date': {
                 'type': 'str | null',
                 'description': 'Filter problems starting from this date (YYYY-MM-DD). Null keeps all.',
-                'value': None
+                'value': None,
             },
             'end_date': {
                 'type': 'str | null',
                 'description': 'Filter problems up to this date (YYYY-MM-DD). Null keeps all.',
-                'value': None
+                'value': None,
             },
             'debug': {
                 'type': 'bool',
-                'description': 'Enable verbose debug logging and bypass certain safety checks.',
-                'value': False
-            }
+                'description': 'Enable verbose debug logging.',
+                'value': False,
+            },
         },
         sandbox_config={
             'image': 'python:3.11-slim',
             'tools_config': {
                 'shell_executor': {},
-                'python_executor': {}
-            }
+                'python_executor': {},
+            },
         },
     )
 )
 class LiveCodeBenchAdapter(DefaultDataAdapter):
     """
-    Live Code Bench adapter using the new data processing framework.
+    Full LiveCodeBench adapter.  No pruning — evaluates all problems.
+    Subclass LiveCodeBenchPrunedAdapter to get the pruned variant.
     """
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-        self.debug = self.extra_params.get('debug', False)
-        self.start_date = self.extra_params.get('start_date')
-        self.end_date = self.extra_params.get('end_date')
-
-        self.save_metadata = False  # Don't save metadata, since they are large
+    def __init__(self, benchmark_meta: BenchmarkMeta, task_config=None):
+        super().__init__(benchmark_meta, task_config)
+        self.benchmark_meta = benchmark_meta
+        self.start_date = self.extra_params.get('start_date', None)
+        self.end_date = self.extra_params.get('end_date', None)
 
     def record_to_sample(self, record: Dict[str, Any]) -> Sample:
-        """Convert a data record to a Sample object."""
+        """Convert a raw dataset record to a Sample."""
         from .load_utils import transform
 
         record = transform(record)
 
-        question_content = record['question_content']
-        format_prompt = record['format_prompt']
-        full_prompt = self.prompt_template.format(question_content=question_content, format_prompt=format_prompt)
+        full_prompt = self.prompt_template.format(
+            question_content=record['question_content'],
+            format_prompt=record['format_prompt'],
+        )
 
         return Sample(
             input=[ChatMessageUser(content=full_prompt)],
             target='',
             metadata={
                 'evaluation_sample': record['evaluation_sample'],
-                'contest_date': record['contest_date']
-            }
+                'contest_date': record['contest_date'],
+                # ↓ Required by LiveCodeBenchPrunedAdapter.sample_filter
+                'index': record['index'],
+            },
         )
 
-    def sample_filter(self, sample):
+    def sample_filter(self, sample: Sample) -> bool:
+        """Keep samples within the configured date window."""
         from .load_utils import filter_date
 
-        return filter_date(sample.metadata['contest_date'], start_date=self.start_date, end_date=self.end_date)
+        return filter_date(
+            sample.metadata['contest_date'],
+            start_date=self.start_date,
+            end_date=self.end_date,
+        )
 
     def extract_answer(self, prediction: str, task_state: TaskState) -> str:
-        """Extract code from the prediction."""
         from .extract_utils import extract_code_generation
+
         return extract_code_generation(prediction)
 
     def match_score(
-        self, original_prediction: str, filtered_prediction: str, reference: str, task_state: TaskState
+        self,
+        original_prediction: str,
+        filtered_prediction: str,
+        reference: str,
+        task_state: TaskState,
     ) -> Score:
         score = Score(
             extracted_prediction=filtered_prediction,
@@ -162,7 +167,6 @@ class LiveCodeBenchAdapter(DefaultDataAdapter):
         )
 
         if not self.use_sandbox:
-            # Use original evaluation method
             from .evaluate_utils import codegen_metrics
 
             references = [{'input_output': task_state.metadata['evaluation_sample']}]
@@ -177,43 +181,39 @@ class LiveCodeBenchAdapter(DefaultDataAdapter):
                     timeout=self.review_timeout,
                     debug=self.debug,
                 )
-                pass_rate = metrics['pass@1'] / 100  # convert to point scale
+                pass_rate = metrics['pass@1'] / 100
 
                 score.value = {'acc': float(pass_rate > 0)}
                 score.explanation = f"Pass@1: {metrics['pass@1']}%"
-
-                # Convert numpy types to native Python types for JSON serialization
-                serializable_eval_results = convert_normal_types(eval_results)
-                serializable_final_metadata = convert_normal_types(final_metadata)
-
                 score.metadata = {
                     'pass_rate': float(pass_rate),
                     'timeout': self.review_timeout,
                     'debug': self.debug,
-                    'eval_results': serializable_eval_results,
-                    'final_metadata': serializable_final_metadata
+                    'eval_results': convert_normal_types(eval_results),
+                    'final_metadata': convert_normal_types(final_metadata),
                 }
             except Exception as e:
                 score.value = {'acc': False}
                 score.explanation = f'Evaluation failed: {str(e)}'
                 score.metadata = {'error': str(e)}
         else:
-            # Use sandbox execution
+            from .sandbox_evaluate_utils import evaluate_in_sandbox
+
             try:
-                from .sandbox_evaluate_utils import evaluate_in_sandbox
-
-                evaluation_sample = task_state.metadata['evaluation_sample']
                 passed, detailed_results = evaluate_in_sandbox(
-                    self, filtered_prediction, evaluation_sample, timeout=self.review_timeout, debug=self.debug
+                    self,
+                    filtered_prediction,
+                    task_state.metadata['evaluation_sample'],
+                    timeout=self.review_timeout,
+                    debug=self.debug,
                 )
-
                 score.value = {'acc': passed}
                 score.explanation = f"Sandbox execution: {'Passed' if passed else 'Failed'}"
                 score.metadata = {
                     'timeout': self.review_timeout,
                     'debug': self.debug,
                     'execution_method': 'sandbox',
-                    'detailed_results': detailed_results
+                    'detailed_results': detailed_results,
                 }
             except Exception as e:
                 score.value = {'acc': False}

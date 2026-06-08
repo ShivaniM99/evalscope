@@ -109,7 +109,7 @@ AA-LCR (Artificial Analysis Long Context Retrieval) is a benchmark for evaluatin
             },
             'scores_path': {
                 'type': 'str | null',
-                'description': 'Path to aa_lcr_flat JSONL with acc, reasoning_len, input_tokens columns.',
+                'description': 'Path to aa_lcr_flat CSV or JSONL with columns: index, model, acc, reasoning_len, input_tokens.',
                 'value': None
             },
             'random_state': {
@@ -130,21 +130,29 @@ class AALCRAdapter(DefaultDataAdapter):
         # Get extra parameters
         self.text_dir = self.extra_params.get('text_dir')
 
-        # ── Pruning (new) ──────────────────────────────
+        # ── Pruning ────────────────────────────────────
         self._pruned_indices: Optional[List[int]] = None
+        self._pruned_index_set: Optional[set] = None
         pruning_strategy = self.extra_params.get('pruning_strategy')
         if pruning_strategy == 'stratified_discriminability':
             scores_path = self.extra_params.get('scores_path')
             if not scores_path:
                 raise ValueError(
                     "pruning_strategy='stratified_discriminability' requires "
-                    "'scores_path' in extra_params pointing to aa_lcr_flat JSONL."
+                    "'scores_path' in extra_params pointing to the aa_lcr_flat "
+                    "CSV or JSONL file."
                 )
-            scores_df = pd.read_json(scores_path, lines=True)
+            # Accept both CSV and JSONL
+            p = Path(scores_path)
+            if p.suffix.lower() == '.csv':
+                scores_df = pd.read_csv(scores_path)
+            else:
+                scores_df = pd.read_json(scores_path, lines=True)
             pruner = StratifiedDiscriminabilityPruner(
                 random_state=int(self.extra_params.get('random_state', 42))
             )
             self._pruned_indices = pruner.fit_transform(scores_df)
+            self._pruned_index_set = set(self._pruned_indices)
             logger.info(
                 f'[AA-LCR Pruner] Selected {len(self._pruned_indices)}/100 '
                 f"questions via '{pruning_strategy}'"
@@ -162,18 +170,24 @@ class AALCRAdapter(DefaultDataAdapter):
             )
 
         self.text_dir = Path(self.text_dir)
-
-        # ── Pruning filter (new) ───────────────────────
-        if self._pruned_indices is not None:
-            original_load = super().load()
-            filtered = [r for r in original_load if r.get('index') in self._pruned_indices]
-            logger.info(
-                f'[AA-LCR Pruner] Filtered {len(original_load)} → {len(filtered)} questions'
-            )
-            return filtered
-        # ── End pruning filter ─────────────────────────
-
         return super().load()
+
+    def sample_filter(self, sample: Sample) -> bool:
+        """
+        Return True only if this sample's index is in the pruned set.
+        When no pruning strategy is configured, all samples pass.
+
+        evalscope calls this for every sample after record_to_sample().
+        This is the correct evalscope hook for subsetting — avoids touching
+        the DatasetDict returned by load().
+        """
+        if self._pruned_index_set is None:
+            return True
+        idx = sample.metadata.get('index')
+        if idx is None:
+            logger.warning('[AA-LCR Pruner] sample missing "index" in metadata — excluded')
+            return False
+        return int(idx) in self._pruned_index_set
 
     def _ensure_text_dir_downloaded(self) -> Path:
         """Ensure AA-LCR extracted texts are available locally; download and extract if missing."""
@@ -249,6 +263,7 @@ class AALCRAdapter(DefaultDataAdapter):
             input=[ChatMessageUser(content=prompt)],
             target=record['answer'],
             metadata={
+                'index': record.get('index'),          # required by sample_filter
                 'question': record['question'],
                 'data_source_urls': record['data_source_urls'],
                 'input_tokens': record.get('input_tokens', 0),
