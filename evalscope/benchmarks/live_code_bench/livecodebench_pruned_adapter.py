@@ -4,36 +4,28 @@ livecodebench_pruned_adapter.py
 ================================
 evalscope adapter for the PRUNED LiveCodeBench variant.
 
-How the pruning is wired into evalscope's pipeline
-----------------------------------------------------
-evalscope's runner calls these methods on each dataset record in order:
+Pruning is wired via PrunedAdapterMixin — the universal base that handles
+the evalscope sample_filter hook and lazy index caching.  This class only
+needs to implement _select_indices() with LCB-specific logic.
 
-  record_to_sample(record)  →  Sample      (inherited from LiveCodeBenchAdapter)
-  sample_filter(sample)     →  bool        (OVERRIDDEN HERE — this is where pruning happens)
-  extract_answer(...)       →  str         (inherited)
-  match_score(...)          →  Score       (inherited)
+Algorithm
+---------
+1. Keep ALL problems where any pair of reference models disagrees on pass/fail.
+2. Add K unanimous all-pass problems per (difficulty × category) cell as
+   calibration anchors.  K=6 → 165/315 problems, Pearson=1.0, Spearman=1.0.
+3. Fill any cell that still has zero coverage with any unanimous problem.
 
-By overriding `sample_filter` we hook into the one point in the pipeline where
-evalscope asks "should I keep this sample?" — which is exactly what we need.
-The pruner computes a fixed set of indices from reference data ONCE, caches it,
-and then every subsequent call is just a set-membership check.
-
-The selected index set is computed from historical reference model data
-(3 models shipped with the task) and is FIXED before any new model runs.
-A fourth unknown model is evaluated on this fixed subset — it cannot influence
-which problems were chosen. This is what makes the pruner generalisable.
-
-Parameters (passed via extra_params in BenchmarkMeta or evalscope CLI --extra-params)
----------------------------------------------------------------------------
-joined_csv_path          : str | None   — path to a pre-built joined CSV (fastest)
-prediction_dir           : str | None   — dir of reference prediction JSONL files
-review_dir               : str | None   — dir of reference review JSONL files
-min_per_cell             : int          — minimum problems per (tier × category) cell  [default 1]
-max_unanimous_fill_per_cell : int       — cap on unanimous fillers added per cell      [default 1]
-start_date / end_date    : str | None   — inherited date filter from parent
-debug                    : bool         — verbose logging
+Parameters (extra_params)
+-------------------------
+prediction_dir      : dir of reference prediction JSONL files
+review_dir          : dir of reference review JSONL files
+joined_csv_path     : pre-built joined CSV (faster alternative)
+k_allpass_per_cell  : int  [default 6]
+fill_missing_cells  : bool [default True]
+start_date          : YYYY-MM-DD or null
+end_date            : YYYY-MM-DD or null
 """
-from typing import Any, Dict, List, Optional, Set
+from typing import List, Optional
 
 from evalscope.api.benchmark import BenchmarkMeta
 from evalscope.api.dataset import Sample
@@ -41,10 +33,10 @@ from evalscope.api.registry import register_benchmark
 from evalscope.constants import Tags
 from evalscope.utils.logger import get_logger
 
+from evalscope.benchmarks._pruned_mixin import PrunedAdapterMixin
 from .live_code_bench_adapter import LiveCodeBenchAdapter
 from .pruners.livecodebench_pruner import (
     LiveCodeBenchPruningConfig,
-    filter_records_by_indices,
     load_joined_reference_dataframe,
     select_livecodebench_indices,
 )
@@ -62,30 +54,32 @@ logger = get_logger()
 
 Pruned variant of LiveCodeBench for fast, cheap model-quality checks.
 
-### Selection strategy: disagreement-first + coverage fill
+### Selection strategy: disagreement-first + calibration fill
 
 1. **Keep all discriminative problems** — any problem where at least one pair of
-   reference models disagree on pass/fail. These problems carry maximum signal
-   for separating strong from weak models.
+   reference models disagree on pass/fail.
 
-2. **Fill missing (difficulty × category) cells** — add a small number of
-   unanimous problems only where a cell would otherwise have zero representation,
-   ensuring broad capability coverage even after heavy pruning.
+2. **Add K all-pass calibration anchors per (difficulty × category) cell** — ensures
+   every cell has baseline coverage and anchors the pass-rate scale.
+
+3. **Fill missing cells** — last-resort unanimous filler for zero-coverage cells.
 
 ### Why this works for an unknown fourth model
 
 The index set is computed once from reference data and is **fixed** before the
-new model runs. The new model cannot influence which problems are selected.
+new model runs.
 
 ### Parameters
 
 | Parameter | Default | Description |
 |---|---|---|
-| `joined_csv_path` | null | Pre-built joined CSV (prediction+review). Fastest option. |
-| `prediction_dir` | null | Directory of reference prediction JSONL files. |
-| `review_dir` | null | Directory of reference review JSONL files. |
-| `k_allpass_per_cell` | 6 | All-pass calibration anchors per cell. K=6 gives 165/315 problems, pearson=1.0. |
-| `fill_missing_cells` | true | Fill zero-coverage cells with any unanimous problem as fallback. |
+| `prediction_dir` | null | Directory of reference prediction JSONL files |
+| `review_dir` | null | Directory of reference review JSONL files |
+| `joined_csv_path` | null | Pre-built joined CSV (fastest option) |
+| `k_allpass_per_cell` | 6 | All-pass anchors per cell (K=6 → 165/315, Pearson=1.0) |
+| `fill_missing_cells` | true | Fill zero-coverage cells with any unanimous problem |
+| `start_date` | null | Filter problems from this date (YYYY-MM-DD) |
+| `end_date` | null | Filter problems up to this date (YYYY-MM-DD) |
 """,
         dataset_id='evalscope/livecodebench_code_generation_lite_parquet',
         subset_list=[
@@ -109,7 +103,7 @@ new model runs. The new model cannot influence which problems are selected.
         extra_params={
             'start_date': {
                 'type': 'str | null',
-                'description': 'Filter problems starting from this date (YYYY-MM-DD). Null keeps all.',
+                'description': 'Filter problems from this date (YYYY-MM-DD). Null keeps all.',
                 'value': None,
             },
             'end_date': {
@@ -117,14 +111,9 @@ new model runs. The new model cannot influence which problems are selected.
                 'description': 'Filter problems up to this date (YYYY-MM-DD). Null keeps all.',
                 'value': None,
             },
-            'debug': {
-                'type': 'bool',
-                'description': 'Enable verbose debug logging.',
-                'value': False,
-            },
             'joined_csv_path': {
                 'type': 'str | null',
-                'description': 'Path to pre-joined prediction/review CSV for pruned subset construction.',
+                'description': 'Path to pre-joined prediction/review CSV.',
                 'value': None,
             },
             'prediction_dir': {
@@ -139,12 +128,12 @@ new model runs. The new model cannot influence which problems are selected.
             },
             'k_allpass_per_cell': {
                 'type': 'int',
-                'description': 'All-pass unanimous problems added per cell as calibration anchors. K=6 is optimal (165/315 problems, pearson=1.0, spearman=1.0).',
+                'description': 'All-pass unanimous problems per cell. K=6 is optimal.',
                 'value': 6,
             },
             'fill_missing_cells': {
                 'type': 'bool',
-                'description': 'Fill any cell with zero coverage after K-fill using any unanimous problem.',
+                'description': 'Fill zero-coverage cells with any unanimous problem.',
                 'value': True,
             },
         },
@@ -157,88 +146,47 @@ new model runs. The new model cannot influence which problems are selected.
         },
     )
 )
-class LiveCodeBenchPrunedAdapter(LiveCodeBenchAdapter):
+class LiveCodeBenchPrunedAdapter(PrunedAdapterMixin, LiveCodeBenchAdapter):
     """
     LiveCodeBench adapter that evaluates only a pruned subset of problems.
 
-    The subset is selected once from reference model data, cached in
-    `_pruned_indices`, and then applied via `sample_filter` — the standard
-    evalscope hook for per-sample inclusion decisions.
+    Inherits universal pruning plumbing from PrunedAdapterMixin and
+    implements _select_indices() with LCB-specific disagreement-first logic.
     """
 
     def __init__(self, benchmark_meta: BenchmarkMeta, task_config=None):
-        # ── Match parent's positional signature exactly ──────────────────────
         super().__init__(benchmark_meta, task_config)
+        self.__init_pruned_mixin__()
 
-        params = getattr(benchmark_meta, 'extra_params', {}) or {}
+        self.joined_csv_path: Optional[str] = self._get_extra_param('joined_csv_path')
+        self.prediction_dir:  Optional[str] = self._get_extra_param('prediction_dir')
+        self.review_dir:      Optional[str] = self._get_extra_param('review_dir')
+        self.k_allpass_per_cell: int        = int(self._get_extra_param('k_allpass_per_cell', 6))
+        self.fill_missing_cells: bool       = bool(self._get_extra_param('fill_missing_cells', True))
 
-        def _get(key, default):
-            val = params.get(key, default)
-            if isinstance(val, dict):
-                return val.get('value', default)
-            return val
+    # ── benchmark-specific selection logic ────────────────────────────────────
 
-        self.joined_csv_path: Optional[str]  = _get('joined_csv_path', None)
-        self.prediction_dir:  Optional[str]  = _get('prediction_dir', None)
-        self.review_dir:      Optional[str]  = _get('review_dir', None)
-        self.k_allpass_per_cell: int         = int(_get('k_allpass_per_cell', 6))
-        self.fill_missing_cells: bool        = bool(_get('fill_missing_cells', True))
-
-        # Lazily populated on first call to sample_filter
-        self._pruned_indices: Optional[List[int]] = None
-        self._pruned_index_set: Optional[Set[int]] = None
-
-    # ── Index selection (lazy, cached) ───────────────────────────────────────
-
-    def _ensure_indices_loaded(self) -> Set[int]:
-        """
-        Compute and cache the pruned index set.
-        Called once on the first sample_filter invocation.
-        """
-        if self._pruned_index_set is not None:
-            return self._pruned_index_set
-
-        logger.info('LiveCodeBenchPrunedAdapter: computing pruned index set...')
-
+    def _select_indices(self) -> List[int]:
         joined_df = load_joined_reference_dataframe(
             joined_csv_path=self.joined_csv_path,
             prediction_dir=self.prediction_dir,
             review_dir=self.review_dir,
         )
-
         config = LiveCodeBenchPruningConfig(
             k_allpass_per_cell=self.k_allpass_per_cell,
             fill_missing_cells=self.fill_missing_cells,
         )
-
-        self._pruned_indices = select_livecodebench_indices(joined_df, config=config)
-        self._pruned_index_set = set(self._pruned_indices)
-
+        indices = select_livecodebench_indices(joined_df, config=config)
         logger.info(
-            f'LiveCodeBenchPrunedAdapter: selected {len(self._pruned_indices)} problems '
-            f'(index range {min(self._pruned_indices)}–{max(self._pruned_indices)}).'
+            f'LiveCodeBenchPrunedAdapter: selected {len(indices)} problems '
+            f'(range {min(indices)}–{max(indices)}).'
         )
-        return self._pruned_index_set
+        return indices
 
-    # ── evalscope hook: called once per sample to decide keep/skip ───────────
+    # ── evalscope hook ────────────────────────────────────────────────────────
 
     def sample_filter(self, sample: Sample) -> bool:
-        """
-        Return True only if this sample's index is in the pruned set
-        AND it passes the parent's date filter.
-
-        evalscope calls this for every sample after record_to_sample().
-        This is the single correct place to apply dataset subsetting.
-        """
-        # Parent date filter first (fast, no I/O)
-        if not super().sample_filter(sample):
+        """Apply parent date filter first, then pruned index filter."""
+        if not LiveCodeBenchAdapter.sample_filter(self, sample):
             return False
-
-        # Pruned index filter (loads reference data on first call, then O(1))
-        idx = sample.metadata.get('index')
-        if idx is None:
-            logger.warning('sample missing "index" in metadata — excluded from pruned set')
-            return False
-
-        pruned_set = self._ensure_indices_loaded()
-        return int(idx) in pruned_set
+        return PrunedAdapterMixin.sample_filter(self, sample)

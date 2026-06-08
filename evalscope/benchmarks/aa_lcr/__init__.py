@@ -1,1 +1,2 @@
 from .aa_lcr_adapter import AALCRAdapter
+from .aa_lcr_pruned_adapter import AALCRPrunedAdapter

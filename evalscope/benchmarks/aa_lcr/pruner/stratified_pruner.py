@@ -4,9 +4,14 @@ Selects the smallest subset that preserves model ranking,
 defensible for unseen models via quadrant coverage guarantee.
 """
 from __future__ import annotations
+import ast
+import json
+import re
+from pathlib import Path
+from typing import Dict, List, Optional
+
 import numpy as np
 import pandas as pd
-from typing import List, Dict, Optional
 
 
 class StratifiedDiscriminabilityPruner:
@@ -128,3 +133,116 @@ class StratifiedDiscriminabilityPruner:
             selected.update(sampled["index"].tolist())
 
         return sorted(selected)
+
+    # ──────────────────────────────────────────────
+    # Convenience: build scores_df from raw JSONL files
+    # ──────────────────────────────────────────────
+
+    @staticmethod
+    def build_scores_df(predictions_dir: str, reviews_dir: str) -> pd.DataFrame:
+        """
+        Build the flat scores DataFrame directly from evalscope output files,
+        so reviewers don't need to supply a pre-built CSV.
+
+        Parameters
+        ----------
+        predictions_dir : str
+            Directory containing prediction JSONL files named
+            ``aa_lcr__{model}.jsonl`` (one file per reference model).
+        reviews_dir : str
+            Directory containing review JSONL files named
+            ``aa_lcr__{model}.jsonl`` (one file per reference model).
+
+        Returns
+        -------
+        pd.DataFrame with columns:
+            index, model, acc, reasoning_len, input_tokens
+        """
+        pred_path = Path(predictions_dir)
+        rev_path  = Path(reviews_dir)
+
+        pred_rows: List[dict] = []
+        rev_rows:  List[dict] = []
+
+        # ── parse prediction files ────────────────────────────────────────────
+        for fpath in sorted(pred_path.glob('aa_lcr__*.jsonl')):
+            with open(fpath, encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    rec = json.loads(line)
+
+                    model_output = rec.get('model_output', {})
+                    if isinstance(model_output, str):
+                        try:
+                            model_output = ast.literal_eval(model_output)
+                        except Exception:
+                            model_output = {}
+
+                    # extract reasoning and answer text from choices
+                    reasoning_text = ''
+                    answer_text    = ''
+                    try:
+                        content = model_output['choices'][0]['message']['content']
+                        for part in content:
+                            if part.get('type') == 'reasoning':
+                                reasoning_text = part.get('reasoning') or ''
+                            elif part.get('type') == 'text':
+                                answer_text = part.get('text') or ''
+                    except (KeyError, IndexError, TypeError):
+                        pass
+
+                    meta = rec.get('metadata') or {}
+                    pred_rows.append({
+                        'index':         int(rec['index']),
+                        'model':         rec.get('model', fpath.stem.replace('aa_lcr__', '')),
+                        'input_tokens':  int(meta.get('input_tokens', 0)),
+                        'reasoning_len': len(reasoning_text),
+                        'answer_len':    len(answer_text),
+                    })
+
+        # ── parse review files ────────────────────────────────────────────────
+        for fpath in sorted(rev_path.glob('aa_lcr__*.jsonl')):
+            with open(fpath, encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    rec = json.loads(line)
+
+                    ss = rec.get('sample_score', {})
+                    acc_val = 0.0
+                    try:
+                        acc_val = float(ss['score']['value']['acc'])
+                    except (KeyError, TypeError):
+                        pass
+
+                    # infer model from filename
+                    model_name = fpath.stem.replace('aa_lcr__', '')
+                    rev_rows.append({
+                        'index': int(rec['index']),
+                        'model': model_name,
+                        'acc':   acc_val,
+                    })
+
+        if not pred_rows:
+            raise FileNotFoundError(
+                f'No aa_lcr__*.jsonl prediction files found in {predictions_dir}'
+            )
+        if not rev_rows:
+            raise FileNotFoundError(
+                f'No aa_lcr__*.jsonl review files found in {reviews_dir}'
+            )
+
+        pred_df = pd.DataFrame(pred_rows)
+        rev_df  = pd.DataFrame(rev_rows)
+
+        merged = pred_df.merge(rev_df, on=['index', 'model'], how='inner')
+        if merged.empty:
+            raise ValueError(
+                'Prediction and review files share no (index, model) pairs. '
+                'Check that predictions_dir and reviews_dir are from the same run.'
+            )
+
+        return merged[['index', 'model', 'acc', 'reasoning_len', 'input_tokens']]
